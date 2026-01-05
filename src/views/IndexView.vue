@@ -33,7 +33,9 @@
           v-model:value="roomNum"
           :test="verifyRoomNumber"
           @confirm="connectLive"
-          @cancel="disconnectLive" />
+          confirm-text="连接"
+          cancel-text="断开全部"
+          @cancel="disconnectAllRooms" />
         <ConnectInput
           ref="relayInput"
           label="WS地址"
@@ -44,6 +46,14 @@
           :test="verifyWssUrl"
           @confirm="relayCast"
           @cancel="stopRelayCast" />
+      </div>
+      <div class="view-rooms">
+        <!-- 已连接房间列表 -->
+        <ConnectedRoomsList
+          :rooms="connectedRooms"
+          :active-room-id="activeRoomId"
+          @select="switchRoom"
+          @remove="removeRoom" />
       </div>
       <div class="view-other">
         <!-- 其它弹幕：关注、点赞、进入、控制台等 -->
@@ -58,6 +68,7 @@ import ConnectInput from '@/components/ConnectInput.vue';
 import LiveInfo from '@/components/LiveInfo.vue';
 import LiveStatusPanel from '@/components/LiveStatusPanel.vue';
 import CastList from '@/components/CastList.vue';
+import ConnectedRoomsList from '@/components/ConnectedRoomsList.vue';
 import {
   CastMethod,
   DyCast,
@@ -68,14 +79,18 @@ import {
   type DyMessage,
   type LiveRoom
 } from '@/core/dycast';
+import { RoomManager, type RoomInstance } from '@/core/roomManager';
 import { verifyRoomNum, verifyWsUrl } from '@/utils/verifyUtil';
-import { ref, useTemplateRef } from 'vue';
+import { ref, useTemplateRef, computed, onUnmounted } from 'vue';
 import { CLog } from '@/utils/logUtil';
 import { getId } from '@/utils/idUtil';
 import { RelayCast } from '@/core/relay';
 import SkMessage from '@/components/Message';
 import { formatDate } from '@/utils/commonUtil';
 import FileSaver from '@/utils/fileUtil';
+
+// 房间管理器
+const roomManager = new RoomManager();
 
 // 连接状态
 const connectStatus = ref<ConnectStatus>(0);
@@ -105,14 +120,97 @@ const likeCount = ref<string | number>('*****');
 const castRef = useTemplateRef('castEl');
 // 其它弹幕
 const otherRef = useTemplateRef('otherEl');
-// 所有弹幕
-const allCasts: DyMessage[] = [];
-// 记录弹幕
-const castSet = new Set<string>();
-// 弹幕客户端
-let castWs: DyCast | undefined;
+// 已连接的房间列表（用于显示）
+interface RoomDisplay {
+  id: string;
+  roomNum: string;
+  info?: DyLiveInfo;
+  isConnected: boolean;
+  hasError: boolean;
+  unreadCount: number;
+}
+const connectedRooms = ref<RoomDisplay[]>([]);
+// 当前活动房间ID
+const activeRoomId = ref<string | null>(null);
 // 转发客户端
 let relayWs: RelayCast | undefined;
+
+// 设置房间管理器事件监听
+roomManager.on('roomAdded', room => {
+  updateRoomsList();
+  addConsoleMessage(`正在连接房间 ${room.roomNum} [${room.id}]`);
+  CLog.info(`[IndexView] roomAdded 事件: ${room.roomNum} (${room.id})`);
+});
+
+roomManager.on('roomConnected', (roomId, info) => {
+  updateRoomsList();
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+  
+  SkMessage.success(`房间连接成功 [${room.roomNum}]`);
+  addConsoleMessage(`房间 ${room.roomNum} 已连接`);
+  
+  // 如果是当前活动房间，更新信息
+  if (activeRoomId.value === roomId) {
+    setRoomInfo(info);
+    connectStatus.value = 1;
+  }
+  
+  // 发送直播间信息给转发地址
+  if (relayWs && relayWs.isConnected() && activeRoomId.value === roomId) {
+    relayWs.send(JSON.stringify(info));
+  }
+});
+
+roomManager.on('roomDisconnected', roomId => {
+  updateRoomsList();
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+  
+  addConsoleMessage(`房间 ${room.roomNum} 已断开`);
+  
+  // 如果是当前活动房间，更新状态
+  if (activeRoomId.value === roomId) {
+    connectStatus.value = 3;
+  }
+});
+
+roomManager.on('roomError', (roomId, error) => {
+  updateRoomsList();
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+  
+  SkMessage.error(`房间 ${room.roomNum} 出错: ${error.message}`);
+  
+  // 如果是当前活动房间，更新状态
+  if (activeRoomId.value === roomId) {
+    connectStatus.value = 2;
+  }
+});
+
+roomManager.on('roomMessages', (roomId, messages) => {
+  updateRoomsList();
+  
+  // 如果是当前活动房间，显示消息
+  if (activeRoomId.value === roomId) {
+    handleMessages(messages);
+  }
+});
+
+roomManager.on('activeRoomChanged', roomId => {
+  activeRoomId.value = roomId;
+  updateRoomsList();
+});
+
+roomManager.on('roomRemoved', roomId => {
+  updateRoomsList();
+});
+
+// 清理函数
+onUnmounted(() => {
+  roomManager.clearAll();
+  if (relayWs) relayWs.close(1000);
+});
 
 /**
  * 验证房间号
@@ -175,45 +273,38 @@ const setRoomInfo = function (info?: DyLiveInfo) {
 };
 
 /**
- * 处理消息列表
+ * 处理消息列表（仅用于当前活动房间的显示）
  */
 const handleMessages = function (msgs: DyMessage[]) {
-  const newCasts: DyMessage[] = [];
   const mainCasts: DyMessage[] = [];
   const otherCasts: DyMessage[] = [];
+  
   try {
     for (const msg of msgs) {
       if (!msg.id) continue;
-      if (castSet.has(msg.id)) continue;
-      castSet.add(msg.id);
+      
       switch (msg.method) {
         case CastMethod.CHAT:
-          newCasts.push(msg);
           mainCasts.push(msg);
           break;
         case CastMethod.GIFT:
           if (!msg?.gift?.repeatEnd) {
-            newCasts.push(msg);
             mainCasts.push(msg);
           }
           break;
         case CastMethod.LIKE:
-          newCasts.push(msg);
           otherCasts.push(msg);
           setRoomCount(msg.room);
           break;
         case CastMethod.MEMBER:
-          newCasts.push(msg);
           otherCasts.push(msg);
           setRoomCount(msg.room);
           break;
         case CastMethod.SOCIAL:
-          newCasts.push(msg);
           otherCasts.push(msg);
           setRoomCount(msg.room);
           break;
         case CastMethod.EMOJI_CHAT:
-          newCasts.push(msg);
           mainCasts.push(msg);
           break;
         case CastMethod.ROOM_USER_SEQ:
@@ -225,18 +316,20 @@ const handleMessages = function (msgs: DyMessage[]) {
         case CastMethod.CONTROL:
           if (msg?.room?.status !== RoomStatus.LIVING) {
             // 已经下播
-            newCasts.push(msg);
             otherCasts.push(msg);
-            disconnectLive();
+            addConsoleMessage('主播已下播');
           }
           break;
       }
     }
-  } catch (err) {}
-  // 记录
-  allCasts.push(...newCasts);
+  } catch (err) {
+    CLog.error('处理消息出错:', err);
+  }
+  
   if (castRef.value) castRef.value.appendCasts(mainCasts);
   if (otherRef.value) otherRef.value.appendCasts(otherCasts);
+  
+  // 转发消息
   if (relayWs && relayWs.isConnected()) {
     relayWs.send(JSON.stringify(msgs));
   }
@@ -259,11 +352,9 @@ const addConsoleMessage = function (content: string) {
 };
 
 /**
- * 清理列表
+ * 清理当前显示的消息列表
  */
 function clearMessageList() {
-  castSet.clear();
-  allCasts.length = 0;
   if (castRef.value) castRef.value.clearCasts();
   if (otherRef.value) otherRef.value.clearCasts();
 }
@@ -271,81 +362,178 @@ function clearMessageList() {
 /**
  * 连接房间
  */
-const connectLive = function () {
+const connectLive = async function () {
   try {
-    // 清空上一次连接的消息
-    clearMessageList();
-    CLog.debug('正在连接:', roomNum.value);
-    SkMessage.info(`正在连接：${roomNum.value}`);
-    const cast = new DyCast(roomNum.value);
-    cast.on('open', (ev, info) => {
-      CLog.info('DyCast 房间连接成功');
-      SkMessage.success(`房间连接成功[${roomNum.value}]`);
-      setRoomInputStatus(true);
-      connectStatus.value = 1;
-      setRoomInfo(info);
-      addConsoleMessage('直播间已连接');
-    });
-    cast.on('error', err => {
-      CLog.error('DyCast 连接出错 =>', err);
-      SkMessage.error(`连接出错: ${err}`);
-      connectStatus.value = 2;
+    const roomNumber = roomNum.value.trim();
+    if (!roomNumber) {
+      SkMessage.warning('请输入房间号');
       setRoomInputStatus(false);
-    });
-    cast.on('close', (code, reason) => {
-      CLog.info(`DyCast 房间已关闭[${code}] => ${reason}`);
-      connectStatus.value = 3;
-      setRoomInputStatus(false);
-      switch (code) {
-        case DyCastCloseCode.NORMAL:
-          SkMessage.success('断开成功');
-          break;
-        case DyCastCloseCode.LIVE_END:
-          SkMessage.info('主播已下播');
-          break;
-        case DyCastCloseCode.CANNOT_RECEIVE:
-          SkMessage.error('无法正常接收信息，已关闭');
-          break;
-        default:
-          SkMessage.info('房间已关闭');
-      }
-      if (code === DyCastCloseCode.LIVE_END) {
-        addConsoleMessage(reason || '主播尚未开播或已下播');
-      } else {
-        if (statusPanelRef.value) addConsoleMessage(`连接已关闭，共持续: ${statusPanelRef.value.getDuration()}`);
-        else addConsoleMessage('连接已关闭');
-      }
-    });
-    cast.on('message', msgs => {
-      handleMessages(msgs);
-    });
-    cast.on('reconnecting', (count, code, reason) => {
-      switch (code) {
-        case DyCastCloseCode.CANNOT_RECEIVE:
-          // 无法正常接收信息
-          SkMessage.warning('无法正常接收弹幕，准备重连中');
-          break;
-        default:
-          CLog.warn('DyCast 重连中 =>', count);
-          SkMessage.warning(`正在重连中: ${count}`);
-      }
-    });
-    cast.on('reconnect', ev => {
-      CLog.info('DyCast 重连成功');
-      SkMessage.success('房间重连完成');
-    });
-    cast.connect();
-    castWs = cast;
+      return;
+    }
+
+    // 如果已有房间在连接中，添加小延迟避免同时连接
+    const allRooms = roomManager.getAllRooms();
+    const hasConnectingRooms = allRooms.some(r => !r.isConnected && !r.hasError);
+    
+    if (hasConnectingRooms && allRooms.length > 0) {
+      CLog.info('已有房间正在连接中，等待 1 秒后再连接新房间');
+      SkMessage.info(`已有房间正在连接中，请稍候...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+
+    CLog.debug('正在连接:', roomNumber);
+    SkMessage.info(`正在连接：${roomNumber}`);
+    
+    const roomId = await roomManager.addRoom(roomNumber);
+    updateRoomsList();
+    
+    // 清空输入框并重新启用，以便添加更多房间
+    roomNum.value = '';
+    setRoomInputStatus(false);
   } catch (err) {
     CLog.error('房间连接过程出错:', err);
     SkMessage.error('房间连接过程出错');
     setRoomInputStatus(false);
-    castWs = void 0;
   }
 };
-/** 断开连接 */
-const disconnectLive = function () {
-  if (castWs) castWs.close(1000, '断开连接');
+
+/**
+ * 断开所有房间
+ */
+const disconnectAllRooms = function () {
+  if (roomManager.getRoomCount() === 0) {
+    SkMessage.info('当前没有连接的房间');
+    return;
+  }
+  
+  roomManager.clearAll();
+  connectedRooms.value = [];
+  activeRoomId.value = null;
+  clearMessageList();
+  resetRoomInfo();
+  connectStatus.value = 0;
+  SkMessage.success('已断开所有房间');
+  addConsoleMessage('已断开所有房间');
+};
+
+/**
+ * 移除指定房间
+ */
+const removeRoom = function (roomId: string) {
+  const room = roomManager.getRoom(roomId);
+  if (!room) return;
+  
+  roomManager.removeRoom(roomId);
+  updateRoomsList();
+  
+  // 如果移除的是当前活动房间，需要更新显示
+  if (activeRoomId.value === roomId) {
+    const activeRoom = roomManager.getActiveRoom();
+    if (activeRoom) {
+      switchRoom(activeRoom.id);
+    } else {
+      clearMessageList();
+      resetRoomInfo();
+      connectStatus.value = 0;
+      activeRoomId.value = null;
+    }
+  }
+  
+  SkMessage.success(`已断开房间 ${room.roomNum}`);
+  addConsoleMessage(`已断开房间 ${room.roomNum}`);
+};
+
+/**
+ * 切换房间
+ */
+const switchRoom = function (roomId: string) {
+  roomManager.setActiveRoom(roomId);
+  activeRoomId.value = roomId;
+  updateRoomsList();
+  
+  const room = roomManager.getActiveRoom();
+  if (!room) return;
+  
+  // 更新房间信息
+  setRoomInfo(room.info);
+  
+  // 更新连接状态
+  if (room.isConnected) {
+    connectStatus.value = 1;
+  } else if (room.hasError) {
+    connectStatus.value = 2;
+  } else {
+    connectStatus.value = 0;
+  }
+  
+  // 清空当前显示的弹幕
+  if (castRef.value) castRef.value.clearCasts();
+  if (otherRef.value) otherRef.value.clearCasts();
+  
+  // 加载该房间的所有消息
+  loadRoomMessages(room);
+  
+  CLog.info(`切换到房间 ${room.roomNum}`);
+};
+
+/**
+ * 更新房间列表
+ */
+const updateRoomsList = function () {
+  connectedRooms.value = roomManager.getAllRooms().map(room => ({
+    id: room.id,
+    roomNum: room.roomNum,
+    info: room.info,
+    isConnected: room.isConnected,
+    hasError: room.hasError,
+    unreadCount: room.unreadCount
+  }));
+};
+
+/**
+ * 加载房间消息
+ */
+const loadRoomMessages = function (room: RoomInstance) {
+  const mainCasts: DyMessage[] = [];
+  const otherCasts: DyMessage[] = [];
+  
+  for (const msg of room.messages) {
+    switch (msg.method) {
+      case CastMethod.CHAT:
+      case CastMethod.GIFT:
+      case CastMethod.EMOJI_CHAT:
+        mainCasts.push(msg);
+        break;
+      case CastMethod.LIKE:
+      case CastMethod.MEMBER:
+      case CastMethod.SOCIAL:
+        otherCasts.push(msg);
+        // 更新房间统计信息
+        setRoomCount(msg.room);
+        break;
+      case CastMethod.ROOM_USER_SEQ:
+      case CastMethod.ROOM_STATS:
+        setRoomCount(msg.room);
+        break;
+    }
+  }
+  
+  if (castRef.value) castRef.value.appendCasts(mainCasts);
+  if (otherRef.value) otherRef.value.appendCasts(otherCasts);
+};
+
+/**
+ * 重置房间信息
+ */
+const resetRoomInfo = function () {
+  cover.value = '';
+  title.value = '*****';
+  avatar.value = '';
+  nickname.value = '***';
+  followCount.value = '*****';
+  memberCount.value = '*****';
+  userCount.value = '*****';
+  likeCount.value = '*****';
 };
 
 /** 连接转发房间 */
@@ -360,9 +548,14 @@ const relayCast = function () {
       setRelayInputStatus(true);
       relayStatus.value = 1;
       addConsoleMessage('转发客户端已连接');
-      if (castWs) {
-        // 发送直播间信息给转发地址
-        cast.send(JSON.stringify(castWs.getLiveInfo()));
+      
+      // 发送当前活动房间的直播间信息给转发地址
+      const activeRoom = roomManager.getActiveRoom();
+      if (activeRoom && activeRoom.info) {
+        cast.send(JSON.stringify({
+          ...activeRoom.info,
+          roomNum: activeRoom.roomNum
+        }));
       }
     });
     cast.on('close', (code, msg) => {
@@ -396,18 +589,27 @@ const stopRelayCast = function () {
 
 /** 将弹幕保存到本地文件 */
 const saveCastToFile = function () {
-  if (connectStatus.value === 1) {
+  const activeRoom = roomManager.getActiveRoom();
+  if (!activeRoom) {
+    SkMessage.warning('请先连接房间');
+    return;
+  }
+  
+  if (activeRoom.isConnected) {
     SkMessage.warning('请断开连接后再保存');
     return;
   }
-  const len = allCasts.length;
+  
+  const len = activeRoom.messages.length;
   if (len <= 0) {
     SkMessage.warning('暂无弹幕需要保存');
     return;
   }
+  
   const date = formatDate(new Date(), 'yyyy-MM-dd_HHmmss');
-  const fileName = `[${roomNum.value}]${date}(${len})`;
-  const data = JSON.stringify(allCasts, null, 2);
+  const fileName = `[${activeRoom.roomNum}]${date}(${len})`;
+  const data = JSON.stringify(activeRoom.messages, null, 2);
+  
   FileSaver.save(data, {
     name: fileName,
     ext: '.json',
@@ -516,6 +718,12 @@ $tool: #8b968d;
     flex-direction: column;
     gap: 5px;
   }
+  .view-rooms {
+    width: 100%;
+    height: 220px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+  }
   .view-other {
     display: flex;
     width: 100%;
@@ -544,7 +752,8 @@ $tool: #8b968d;
       height: 100vh;
     }
     .view-right {
-      height: 80vh;
+      height: auto;
+      min-height: 80vh;
     }
     .view-input {
       position: absolute;
@@ -552,6 +761,9 @@ $tool: #8b968d;
       left: 0;
       box-sizing: border-box;
       padding: 18px 12px;
+    }
+    .view-rooms {
+      height: 180px;
     }
     .view-left-bottom {
       position: absolute;
