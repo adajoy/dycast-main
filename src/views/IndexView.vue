@@ -191,6 +191,18 @@ roomManager.on('roomError', (roomId, error) => {
 roomManager.on('roomMessages', (roomId, messages) => {
   updateRoomsList();
   
+  // 转发消息到 WebSocket 服务器（所有房间）
+  if (relayWs && relayWs.isConnected()) {
+    const room = roomManager.getRoom(roomId);
+    // 添加房间信息到消息中，以便服务器区分来源
+    const messagesWithRoomInfo = messages.map(msg => ({
+      ...msg,
+      roomId,
+      roomNum: room?.roomNum
+    }));
+    relayWs.send(JSON.stringify(messagesWithRoomInfo));
+  }
+  
   // 如果是当前活动房间，显示消息
   if (activeRoomId.value === roomId) {
     handleMessages(messages);
@@ -273,7 +285,8 @@ const setRoomInfo = function (info?: DyLiveInfo) {
 };
 
 /**
- * 处理消息列表（仅用于当前活动房间的显示）
+ * 处理消息列表（仅用于当前活动房间的 UI 显示）
+ * 注意：消息转发逻辑已移至 roomMessages 事件处理器，以支持所有房间的消息转发
  */
 const handleMessages = function (msgs: DyMessage[]) {
   const mainCasts: DyMessage[] = [];
@@ -328,11 +341,6 @@ const handleMessages = function (msgs: DyMessage[]) {
   
   if (castRef.value) castRef.value.appendCasts(mainCasts);
   if (otherRef.value) otherRef.value.appendCasts(otherCasts);
-  
-  // 转发消息
-  if (relayWs && relayWs.isConnected()) {
-    relayWs.send(JSON.stringify(msgs));
-  }
 };
 
 /**
