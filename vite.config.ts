@@ -6,6 +6,7 @@ import vue from '@vitejs/plugin-vue';
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: '/dy-cast/', // 设置公共基础路径用于生产环境
   plugins: [
     vue()
     // vueDevTools(),
